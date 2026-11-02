@@ -1,0 +1,42 @@
+# Portainer stack file. Images are pulled from Docker Hub (jgruber/*) — the
+# GitHub Actions workflow in .github/workflows/docker-publish.yml rebuilds and
+# pushes them on every push to main. See docs/DEPLOY.md for the cutover flow.
+# Portainer's web editor supports neither `build:` nor `env_file:`, so Portainer
+# substitutes the variables itself.
+services:
+  bridge:
+    image: docker.io/jgruber/whatsapp-mcp-bridge:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      WHATSAPP_BRIDGE_PORT: "8080"
+      WHATSAPP_DB_PATH: /app/store/messages.db
+      WHATSMEOW_DB_PATH: /app/store/whatsapp.db
+      WHATSAPP_DEVICE_NAME: ${WHATSAPP_DEVICE_NAME:-whatsapp-mcp}
+      WHATSAPP_MEDIA_ROOTS: /app/store/outbox:/app/store/uploads
+    volumes:
+      - store:/app/store
+
+  mcp:
+    image: docker.io/jgruber/whatsapp-mcp-server:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      - bridge
+    environment:
+      WHATSAPP_MCP_TRANSPORT: http
+      WHATSAPP_MCP_HOST: 0.0.0.0
+      WHATSAPP_MCP_PORT: "8000"
+      WHATSAPP_API_URL: http://bridge:8080/api
+      WHATSAPP_DB_PATH: /app/store/messages.db
+      WHATSMEOW_DB_PATH: /app/store/whatsapp.db
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN in the stack environment}
+      UPLOAD_DIR: /app/store/uploads
+      # Public hostnames the Host-header allow-list should also accept
+      # (comma-separated); the stock allow-list already includes loopback.
+      WHATSAPP_MCP_ALLOWED_HOSTS: ${WHATSAPP_MCP_ALLOWED_HOSTS:-}
+    ports:
+      - "${MCP_HOST_PORT:-8800}:8000"
+    volumes:
+      - store:/app/store
+
+volumes:
+  store:

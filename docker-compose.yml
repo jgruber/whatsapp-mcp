@@ -1,0 +1,53 @@
+# Local build-and-run compose for dev + CI.
+# Portainer uses docker-compose.portainer.yml instead (image-only, no build context).
+services:
+  bridge:
+    build:
+      context: ./whatsapp-bridge
+    image: whatsapp-mcp-bridge:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    environment:
+      WHATSAPP_BRIDGE_PORT: "8080"
+      # Host header the bridge accepts when the mcp container calls it by
+      # its compose service name. Must track the port above.
+      WHATSAPP_BRIDGE_ALLOWED_HOSTS: bridge:8080
+      WHATSAPP_DB_PATH: /app/store/messages.db
+      WHATSMEOW_DB_PATH: /app/store/whatsapp.db
+      WHATSAPP_DEVICE_NAME: ${WHATSAPP_DEVICE_NAME:-whatsapp-mcp}
+      # Media allowlist for /api/send media_path. Keep inside the shared volume.
+      WHATSAPP_MEDIA_ROOTS: /app/store/outbox:/app/store/uploads
+    volumes:
+      - store:/app/store
+    # No published ports: only the mcp container needs to reach the bridge,
+    # and the bridge REST already enforces WHATSAPP_BRIDGE_TOKEN.
+
+  mcp:
+    build:
+      context: ./whatsapp-mcp-server
+    image: whatsapp-mcp-server:${IMAGE_TAG:-dev}
+    restart: unless-stopped
+    depends_on:
+      - bridge
+    environment:
+      WHATSAPP_MCP_TRANSPORT: http
+      WHATSAPP_MCP_HOST: 0.0.0.0
+      WHATSAPP_MCP_PORT: "8000"
+      WHATSAPP_API_URL: http://bridge:8080/api
+      WHATSAPP_DB_PATH: /app/store/messages.db
+      WHATSMEOW_DB_PATH: /app/store/whatsapp.db
+      # Public bearer token clients present to /mcp and /upload.
+      # Must be at least 32 chars; set in your env or a .env file beside this compose.
+      MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN to a random string of at least 32 chars}
+      # Where /upload writes bytes before send_file consumes them.
+      # Must match the bridge's WHATSAPP_MEDIA_ROOTS so the bridge can read what mcp wrote.
+      UPLOAD_DIR: /app/store/uploads
+      # Public hostnames the Host-header allow-list should also accept
+      # (comma-separated); the stock allow-list already includes loopback.
+      WHATSAPP_MCP_ALLOWED_HOSTS: ${WHATSAPP_MCP_ALLOWED_HOSTS:-}
+    ports:
+      - "${MCP_HOST_PORT:-8800}:8000"
+    volumes:
+      - store:/app/store
+
+volumes:
+  store:

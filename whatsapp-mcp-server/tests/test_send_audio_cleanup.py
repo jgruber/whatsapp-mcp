@@ -24,7 +24,7 @@ def test_send_audio_removes_converted_temp_file(tmp_path, monkeypatch, status_co
     src.write_bytes(b"not really mp3")
     converted = tmp_path / "converted.ogg"
 
-    def fake_convert(path):
+    def fake_convert(path, **kwargs):
         converted.write_bytes(b"ogg")
         return str(converted)
 
@@ -43,7 +43,7 @@ def test_send_audio_removes_converted_temp_file_after_request_exception(tmp_path
     src.write_bytes(b"not really mp3")
     converted = tmp_path / "converted.ogg"
 
-    def fake_convert(path):
+    def fake_convert(path, **kwargs):
         converted.write_bytes(b"ogg")
         return str(converted)
 
@@ -64,7 +64,7 @@ def test_send_audio_removes_converted_temp_file_after_request_exception(tmp_path
 def test_send_audio_leaves_native_ogg_in_place(tmp_path, monkeypatch):
     src = tmp_path / "voice.ogg"
     src.write_bytes(b"ogg")
-    monkeypatch.setattr(whatsapp.audio, "convert_to_opus_ogg_temp", lambda p: pytest.fail("must not convert .ogg"))
+    monkeypatch.setattr(whatsapp.audio, "convert_to_opus_ogg_temp", lambda p, **k: pytest.fail("must not convert .ogg"))
     monkeypatch.setattr(whatsapp.requests, "post", lambda *a, **k: _Resp())
 
     ok, _ = whatsapp.send_audio_message("12025551234", str(src))

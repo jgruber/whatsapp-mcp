@@ -10,6 +10,7 @@ from typing import Any
 import requests
 
 import audio
+import uploads
 
 # Configuration via environment variables with sensible defaults
 _DEFAULT_BRIDGE_STORE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "whatsapp-bridge", "store")
@@ -1254,7 +1255,11 @@ def send_audio_message(recipient: str, media_path: str) -> tuple[bool, str]:
         converted_path: str | None = None
         if not media_path.endswith(".ogg"):
             try:
-                media_path = audio.convert_to_opus_ogg_temp(media_path)
+                # Put the converted .ogg inside UPLOAD_DIR, which the bridge
+                # also mounts and is in its WHATSAPP_MEDIA_ROOTS allow-list.
+                # In a container the system tempdir is not visible to the
+                # bridge, so a plain NamedTemporaryFile would be rejected.
+                media_path = audio.convert_to_opus_ogg_temp(media_path, dir=uploads.scratch_dir())
                 converted_path = media_path
             except Exception as e:
                 return False, f"Error converting file to opus ogg. You likely need to install ffmpeg: {str(e)}"
@@ -1423,3 +1428,97 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Group management
+# ---------------------------------------------------------------------------
+
+
+def _bridge_json(method: str, path: str, body: dict | None = None, params: dict | None = None) -> tuple[int, Any]:
+    """Call the bridge and return (status_code, parsed_body_or_text).
+
+    Keeps the group helpers short — they only need the raw response.
+    """
+    url = f"{WHATSAPP_API_BASE_URL}{path}"
+    try:
+        resp = requests.request(
+            method, url, json=body, params=params, headers=_bridge_headers(), timeout=30
+        )
+    except requests.RequestException as e:
+        return 0, {"error": f"request error: {e}"}
+    try:
+        return resp.status_code, resp.json()
+    except json.JSONDecodeError:
+        return resp.status_code, {"error": resp.text or f"HTTP {resp.status_code}"}
+
+
+def _encode_group_jid(group_jid: str) -> str:
+    """URL-encode a group JID for use in a path segment.
+
+    `@` is kept readable (it's reserved only in authority, not path) but
+    `/`, `?`, `#`, spaces, and anything else that would break path routing
+    is percent-encoded. Prevents a user-controlled JID from injecting path
+    segments into /api/groups/<...>/participants.
+    """
+    from urllib.parse import quote
+    return quote(group_jid.strip(), safe="@")
+
+
+def list_groups() -> dict:
+    """GET /api/groups → {"groups": [...]} or {"error": ...}."""
+    status, body = _bridge_json("GET", "/groups")
+    if status == 200 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def get_group_info(group_jid: str) -> dict:
+    """GET /api/groups/{jid} → full group record with participants."""
+    status, body = _bridge_json("GET", f"/groups/{_encode_group_jid(group_jid)}")
+    if status == 200 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def create_group(name: str, participants: list[str]) -> dict:
+    """POST /api/groups — returns the new group's info on success."""
+    status, body = _bridge_json(
+        "POST", "/groups", body={"name": name, "participants": participants}
+    )
+    if status == 201 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def update_group_participants(
+    group_jid: str, action: str, participants: list[str]
+) -> dict:
+    """PATCH /api/groups/{jid}/participants — action in add|remove|promote|demote."""
+    status, body = _bridge_json(
+        "PATCH",
+        f"/groups/{_encode_group_jid(group_jid)}/participants",
+        body={"action": action, "participants": participants},
+    )
+    if status == 200 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def get_group_invite_link(group_jid: str, reset: bool = False) -> dict:
+    """GET or POST /api/groups/{jid}/invite-link → {"invite_link": "..."}."""
+    method = "POST" if reset else "GET"
+    status, body = _bridge_json(
+        method,
+        f"/groups/{_encode_group_jid(group_jid)}/invite-link",
+        params={"reset": "true"} if reset else None,
+    )
+    if status == 200 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def _error_message(body: Any, status: int) -> str:
+    if isinstance(body, dict):
+        return body.get("error") or body.get("message") or f"HTTP {status}"
+    return str(body) if body else f"HTTP {status}"

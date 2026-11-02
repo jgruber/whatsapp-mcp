@@ -1,0 +1,3 @@
+store/
+*_test.go
+.env*

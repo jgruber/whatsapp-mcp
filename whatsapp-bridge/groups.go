@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
 
@@ -79,8 +80,16 @@ func jidString(j types.JID) string {
 	return j.String()
 }
 
+// userJIDPattern matches a phone-style user part: all digits, optionally
+// followed by a `:device` suffix (e.g. "14155551234:12"). Rejects garbage
+// like "not a jid" that would otherwise become a cursed JID.
+var userJIDPattern = regexp.MustCompile(`^[0-9]+(:[0-9]+)?$`)
+
 // participantsToJIDs normalizes a list of phone numbers or JIDs to
-// []types.JID. Blank entries are skipped; invalid entries cause an error.
+// []types.JID. Blank entries are skipped. Rejected: non-numeric phone
+// inputs, group JIDs (`@g.us`), and anything that is neither a user
+// (`@s.whatsapp.net`) nor a LID (`@lid`) — passing those to whatsmeow's
+// group-participant APIs would surface as an opaque WA error.
 func participantsToJIDs(raw []string) ([]types.JID, error) {
 	out := make([]types.JID, 0, len(raw))
 	for _, s := range raw {
@@ -92,11 +101,18 @@ func participantsToJIDs(raw []string) ([]types.JID, error) {
 		var err error
 		if strings.Contains(s, "@") {
 			jid, err = types.ParseJID(s)
+			if err != nil || jid.User == "" || jid.Server == "" {
+				return nil, fmt.Errorf("invalid participant %q", s)
+			}
 		} else {
+			if !userJIDPattern.MatchString(s) {
+				return nil, fmt.Errorf("invalid participant %q (phone must be digits only)", s)
+			}
 			jid = types.NewJID(s, types.DefaultUserServer)
 		}
-		if err != nil || jid.User == "" || jid.Server == "" {
-			return nil, fmt.Errorf("invalid participant %q", s)
+		if jid.Server != types.DefaultUserServer && jid.Server != types.HiddenUserServer {
+			return nil, fmt.Errorf("participant %q must be a user JID (@%s or @%s), got @%s",
+				s, types.DefaultUserServer, types.HiddenUserServer, jid.Server)
 		}
 		out = append(out, jid)
 	}
@@ -131,6 +147,17 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(body)
+}
+
+// maxGroupBodyBytes caps JSON request bodies on the group endpoints. 1 MiB
+// is far more than any sane participants list and plenty of margin for the
+// name/action payloads; the cap exists so an authenticated caller can't
+// drive the bridge OOM with a 2 GB body.
+const maxGroupBodyBytes = 1 << 20
+
+func decodeGroupBody(w http.ResponseWriter, r *http.Request, dst any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, maxGroupBodyBytes)
+	return json.NewDecoder(r.Body).Decode(dst)
 }
 
 // registerGroupRoutes wires the five group endpoints onto the shared mux.
@@ -196,7 +223,16 @@ func handleListGroups(w http.ResponseWriter, _ *http.Request, client *whatsmeow.
 func handleGroupInfo(w http.ResponseWriter, _ *http.Request, client *whatsmeow.Client, jid types.JID) {
 	info, err := client.GetGroupInfo(context.Background(), jid)
 	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
+		status := http.StatusInternalServerError
+		// whatsmeow surfaces WA's own IQ error for a missing group; the exact
+		// error type varies across versions, so match on the message. A
+		// non-NotFound error (e.g. a disconnected socket) stays as 500 so the
+		// client can distinguish a real not-found from a transient failure.
+		if msg := strings.ToLower(err.Error()); strings.Contains(msg, "not found") ||
+			strings.Contains(msg, "no such group") || strings.Contains(msg, "item-not-found") {
+			status = http.StatusNotFound
+		}
+		writeJSON(w, status, map[string]string{"error": err.Error()})
 		return
 	}
 	writeJSON(w, http.StatusOK, groupInfoToJSON(info, true))
@@ -207,8 +243,8 @@ func handleCreateGroup(w http.ResponseWriter, r *http.Request, client *whatsmeow
 		Name         string   `json:"name"`
 		Participants []string `json:"participants"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+	if err := decodeGroupBody(w, r, &req); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	name := strings.TrimSpace(req.Name)
@@ -237,8 +273,8 @@ func handleUpdateParticipants(w http.ResponseWriter, r *http.Request, client *wh
 		Action       string   `json:"action"`
 		Participants []string `json:"participants"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+	if err := decodeGroupBody(w, r, &req); err != nil {
+		http.Error(w, "invalid JSON body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	var action whatsmeow.ParticipantChange

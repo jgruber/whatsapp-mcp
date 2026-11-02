@@ -16,6 +16,22 @@ import transcription
 import uploads
 
 
+_EXTRA_ALLOWED_HOSTS: list[str] = [
+    h.strip() for h in os.getenv("WHATSAPP_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
+]
+
+
+def _origin_for(host: str) -> str:
+    """Return just the <scheme-less-authority> for `host`, preserving an
+    explicit port and keeping IPv6 brackets intact.
+
+    "whats.grubernet.org"        -> "whats.grubernet.org"
+    "whats.grubernet.org:8443"   -> "whats.grubernet.org:8443"
+    "[::1]:8800"                 -> "[::1]:8800"
+    """
+    return host
+
+
 def _build_transport_security() -> TransportSecuritySettings:
     """Extend FastMCP's localhost-only default allow-list with the hosts the
     public reverse proxy forwards to us.
@@ -26,15 +42,14 @@ def _build_transport_security() -> TransportSecuritySettings:
     stock allow-list. Add the public FQDNs via WHATSAPP_MCP_ALLOWED_HOSTS
     (comma-separated) rather than disabling the check.
     """
-    extra = [h.strip() for h in os.getenv("WHATSAPP_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    origins: list[str] = ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"]
+    for h in _EXTRA_ALLOWED_HOSTS:
+        authority = _origin_for(h)
+        origins.extend([f"https://{authority}", f"http://{authority}"])
     return TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *extra],
-        allowed_origins=[
-            "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
-            *(f"https://{h.split(':')[0]}" for h in extra),
-            *(f"http://{h.split(':')[0]}" for h in extra),
-        ],
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *_EXTRA_ALLOWED_HOSTS],
+        allowed_origins=origins,
     )
 from mcp_config import resolve_host, resolve_port, resolve_transport
 from parent_watchdog import install_stdio_parent_watchdog
@@ -574,7 +589,8 @@ def create_group(name: str, participants: list[str]) -> dict[str, Any]:
     The authenticated account is implicitly added as the group owner.
 
     Args:
-        name: Visible group name (1–100 chars; WhatsApp trims very long names).
+        name: Visible group name (1–25 chars; WhatsApp rejects longer names
+            with "406 Not Acceptable").
         participants: List of phone numbers (digits only, with country code,
             no + or symbols) OR full JIDs ending in "@s.whatsapp.net".
             At least one participant other than yourself is required.
@@ -802,11 +818,32 @@ async def upload_route(request: Request) -> JSONResponse:
     )
 
 
-class BearerTokenAuth:
-    """ASGI middleware that rejects HTTP requests without the expected bearer token.
+def _host_allowed(host: str) -> bool:
+    """Match a Host header value against the same list we hand FastMCP.
 
-    /healthz is allowed through unauthenticated so container probes don't
-    need the secret.
+    FastMCP's TransportSecurityMiddleware only guards the /mcp handler, so we
+    repeat the check in BearerTokenAuth to protect every other route (/upload
+    especially) with the same policy. Trailing ":*" patterns match any port.
+    """
+    h = (host or "").strip().lower()
+    if not h:
+        return False
+    allowed = ["127.0.0.1:*", "localhost:*", "[::1]:*", *_EXTRA_ALLOWED_HOSTS]
+    for pat in allowed:
+        pat = pat.strip().lower()
+        if pat == h:
+            return True
+        if pat.endswith(":*") and h.startswith(pat[:-2] + ":"):
+            return True
+    return False
+
+
+class BearerTokenAuth:
+    """ASGI middleware that rejects HTTP requests without the expected bearer
+    token and with an unknown Host header.
+
+    /healthz is allowed through unauthenticated (any trailing slash tolerated)
+    so container probes don't need the secret.
     """
 
     def __init__(self, app, token: str):
@@ -815,10 +852,16 @@ class BearerTokenAuth:
 
     async def __call__(self, scope, receive, send):
         if scope["type"] == "http":
-            if scope["path"] == "/healthz":
+            # Trailing slash tolerated: some proxies normalise /healthz/
+            if scope["path"].rstrip("/") == "/healthz":
                 await self._respond(send, 200, b"ok")
                 return
-            auth = dict(scope["headers"]).get(b"authorization", b"")
+            headers = dict(scope["headers"])
+            host = headers.get(b"host", b"").decode(errors="ignore")
+            if not _host_allowed(host):
+                await self._respond(send, 403, b"Forbidden: host not allowed")
+                return
+            auth = headers.get(b"authorization", b"")
             if not hmac.compare_digest(auth, self.expected):
                 await self._respond(send, 401, b"Unauthorized")
                 return
@@ -831,14 +874,20 @@ class BearerTokenAuth:
         await send({"type": "http.response.body", "body": body})
 
 
-def _run_http_with_auth() -> None:
-    """Run the streamable-http MCP app behind bearer-token auth with uvicorn."""
+def _run_http_with_auth(sse: bool = False) -> None:
+    """Run the MCP app behind bearer-token auth with uvicorn.
+
+    `sse=False` serves the streamable-http (/mcp) app plus our custom routes
+    (/upload, /healthz). `sse=True` serves the legacy SSE transport. Both
+    paths run through BearerTokenAuth so no transport bypasses auth.
+    """
     import uvicorn
 
     token = os.environ.get("MCP_AUTH_TOKEN", "")
     if len(token) < 32:
         raise SystemExit("MCP_AUTH_TOKEN must be set to a random string of at least 32 characters")
-    app = BearerTokenAuth(mcp.streamable_http_app(), token)
+    inner = mcp.sse_app() if sse else mcp.streamable_http_app()
+    app = BearerTokenAuth(inner, token)
     uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
 
 
@@ -872,9 +921,18 @@ if __name__ == "__main__":
 
     if transport == "stdio":
         install_stdio_parent_watchdog("WHATSAPP_PARENT_WATCHDOG_S", parent_pid=parent_pid)
-    if transport == "streamable-http":
+        mcp.run(transport=transport)
+    elif transport == "streamable-http":
         # Wrap FastMCP's streamable-http app in BearerTokenAuth and serve
         # /upload + /healthz alongside /mcp from the same uvicorn process.
         _run_http_with_auth()
+    elif transport == "sse":
+        # SSE transport runs under the same auth wrapper so no network
+        # transport ever serves tools unauthenticated.
+        _run_http_with_auth(sse=True)
     else:
+        # Should be unreachable: resolve_transport only returns one of the
+        # three handled above. Fall through to FastMCP's default runner so
+        # future transports still work, but shout about it.
+        print(f"warning: no auth wrapper for transport {transport!r}; running unwrapped", file=sys.stderr)
         mcp.run(transport=transport)

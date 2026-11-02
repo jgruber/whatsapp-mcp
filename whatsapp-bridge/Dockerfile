@@ -21,10 +21,12 @@ WORKDIR /app
 USER app
 ENV WHATSAPP_BRIDGE_PORT=8080 \
     WHATSAPP_BRIDGE_BIND=0.0.0.0 \
-    WHATSAPP_BRIDGE_ALLOWED_HOSTS=bridge:8080 \
     WHATSAPP_DB_PATH=/app/store/messages.db \
     WHATSMEOW_DB_PATH=/app/store/whatsapp.db \
     WHATSAPP_MEDIA_ROOTS=/app/store/outbox:/app/store/uploads
+# WHATSAPP_BRIDGE_ALLOWED_HOSTS is intentionally left unset: the right value
+# depends on the compose service name AND port, so set it in the compose
+# file (e.g. `bridge:${WHATSAPP_BRIDGE_PORT:-8080}`) instead of here.
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5m \
   CMD curl -fsS -H "Authorization: Bearer $(cat /app/store/.bridge-token 2>/dev/null)" \

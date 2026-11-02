@@ -9,6 +9,7 @@ services:
     restart: unless-stopped
     environment:
       WHATSAPP_BRIDGE_PORT: "8080"
+      WHATSAPP_BRIDGE_ALLOWED_HOSTS: bridge:8080
       WHATSAPP_DB_PATH: /app/store/messages.db
       WHATSMEOW_DB_PATH: /app/store/whatsapp.db
       WHATSAPP_DEVICE_NAME: ${WHATSAPP_DEVICE_NAME:-whatsapp-mcp}

@@ -1,3 +1,4 @@
+import hmac
 import os
 import signal
 import sys
@@ -5,10 +6,36 @@ import tempfile
 from typing import Annotated, Any
 
 from mcp.server.fastmcp import FastMCP, Image
+from mcp.server.transport_security import TransportSecuritySettings
 from pydantic import Field
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 import media_preview
 import transcription
+import uploads
+
+
+def _build_transport_security() -> TransportSecuritySettings:
+    """Extend FastMCP's localhost-only default allow-list with the hosts the
+    public reverse proxy forwards to us.
+
+    FastMCP binds the DNS-rebinding protection to the Host header the backend
+    sees. When Traefik/nginx preserves the public hostname (the default), it
+    reaches us as something like "whats.grubernet.org", which is not in the
+    stock allow-list. Add the public FQDNs via WHATSAPP_MCP_ALLOWED_HOSTS
+    (comma-separated) rather than disabling the check.
+    """
+    extra = [h.strip() for h in os.getenv("WHATSAPP_MCP_ALLOWED_HOSTS", "").split(",") if h.strip()]
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=["127.0.0.1:*", "localhost:*", "[::1]:*", *extra],
+        allowed_origins=[
+            "http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*",
+            *(f"https://{h.split(':')[0]}" for h in extra),
+            *(f"http://{h.split(':')[0]}" for h in extra),
+        ],
+    )
 from mcp_config import resolve_host, resolve_port, resolve_transport
 from parent_watchdog import install_stdio_parent_watchdog
 from whatsapp import (
@@ -60,10 +87,19 @@ from whatsapp import (
 from whatsapp import (
     send_reaction as whatsapp_send_reaction,
 )
+from whatsapp import (
+    list_groups as whatsapp_list_groups,
+    get_group_info as whatsapp_get_group_info,
+    create_group as whatsapp_create_group,
+    update_group_participants as whatsapp_update_group_participants,
+    get_group_invite_link as whatsapp_get_group_invite_link,
+)
 
 # Initialize FastMCP server. Env-var handling is deferred to the __main__ block
-# so importing this module never parses env vars or exits the process.
-mcp = FastMCP("whatsapp")
+# so importing this module never parses env vars or exits the process. The one
+# exception is WHATSAPP_MCP_ALLOWED_HOSTS, which must be bound at construction
+# time because FastMCP wires transport_security into streamable_http_app().
+mcp = FastMCP("whatsapp", transport_security=_build_transport_security())
 
 PreviewDimension = Annotated[
     int,
@@ -425,8 +461,28 @@ def mark_messages_read(
     return {"success": success, "message": status_message}
 
 
+def _attachment_path(media_path: str | None, upload_id: str | None) -> tuple[str | None, str | None]:
+    """Return (path, error) for the attachment to send. Exactly one of
+    media_path or upload_id must be supplied; the upload is resolved to a
+    path on the shared store volume."""
+    provided = [v for v in (media_path, upload_id) if v]
+    if len(provided) != 1:
+        return None, "pass exactly one of media_path or upload_id"
+    if upload_id:
+        path = uploads.resolve(upload_id)
+        if not path:
+            return None, f"unknown or expired upload_id {upload_id!r}"
+        return path, None
+    return media_path, None
+
+
 @mcp.tool()
-def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, Any]:
+def send_file(
+    recipient: str,
+    media_path: str | None = None,
+    upload_id: str | None = None,
+    caption: str = "",
+) -> dict[str, Any]:
     """Send a file (image, video, document) via WhatsApp, optionally with a caption.
 
     When `caption` is provided, the file and text arrive as a single
@@ -436,33 +492,136 @@ def send_file(recipient: str, media_path: str, caption: str = "") -> dict[str, A
     Args:
         recipient: Either a phone number with country code (no + or symbols),
                  or a JID (e.g., "123456789@s.whatsapp.net" or "123456789@g.us")
-        media_path: Absolute path to the media file (image, video, document)
-        caption: Optional text rendered with the file as a caption. Omit for a
-                 bare attachment.
+        media_path: Absolute path to the media file (image, video, document).
+                 Pass this OR upload_id, not both.
+        upload_id: Id of a file previously posted to POST /upload. Resolved to
+                 a path on the shared store volume. Pass this OR media_path,
+                 not both.
+        caption: Optional text rendered with the file as a caption. Omit for
+                 a bare attachment.
 
     Returns:
         A dictionary containing success status and a status message
     """
-
-    # Call the whatsapp_send_file function
-    success, status_message = whatsapp_send_file(recipient, media_path, caption)
+    path, err = _attachment_path(media_path, upload_id)
+    if err:
+        return {"success": False, "message": err}
+    success, status_message = whatsapp_send_file(recipient, path, caption)
+    if upload_id and success:
+        uploads.delete(upload_id)
     return {"success": success, "message": status_message}
 
 
 @mcp.tool()
-def send_audio_message(recipient: str, media_path: str) -> dict[str, Any]:
+def send_audio_message(
+    recipient: str,
+    media_path: str | None = None,
+    upload_id: str | None = None,
+) -> dict[str, Any]:
     """Send any audio file as a WhatsApp audio message to the specified recipient. For group messages use the JID. If it errors due to ffmpeg not being installed, use send_file instead.
 
     Args:
         recipient: The recipient - either a phone number with country code but no + or other symbols,
                  or a JID (e.g., "123456789@s.whatsapp.net" or a group JID like "123456789@g.us")
-        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file)
+        media_path: The absolute path to the audio file to send (will be converted to Opus .ogg if it's not a .ogg file).
+                 Pass this OR upload_id, not both.
+        upload_id: Id of an audio file previously posted to POST /upload. Pass this OR media_path, not both.
 
     Returns:
         A dictionary containing success status and a status message
     """
-    success, status_message = whatsapp_audio_voice_message(recipient, media_path)
+    path, err = _attachment_path(media_path, upload_id)
+    if err:
+        return {"success": False, "message": err}
+    success, status_message = whatsapp_audio_voice_message(recipient, path)
+    if upload_id and success:
+        uploads.delete(upload_id)
     return {"success": success, "message": status_message}
+
+
+@mcp.tool()
+def list_groups() -> dict[str, Any]:
+    """List every WhatsApp group this account is a member of.
+
+    Returns:
+        {"groups": [{"jid", "name", "topic", "owner_jid", "participant_count",
+                     "created_at", "is_announce", "is_locked", "is_ephemeral"}, ...]}
+        or {"error": "..."} if the bridge reports a failure.
+    """
+    return whatsapp_list_groups()
+
+
+@mcp.tool()
+def get_group_info(group_jid: str) -> dict[str, Any]:
+    """Get a group's full metadata, including every participant and their admin role.
+
+    Args:
+        group_jid: The group's JID. Either "<id>@g.us" or just "<id>".
+
+    Returns:
+        A dict with the group's name/topic/owner/created_at plus a
+        "participants" list where each entry has {"jid", "phone_number",
+        "display_name", "is_admin", "is_super_admin"}. On failure the dict
+        contains an "error" key instead.
+    """
+    return whatsapp_get_group_info(group_jid)
+
+
+@mcp.tool()
+def create_group(name: str, participants: list[str]) -> dict[str, Any]:
+    """Create a new WhatsApp group with the given name and initial participants.
+
+    The authenticated account is implicitly added as the group owner.
+
+    Args:
+        name: Visible group name (1–100 chars; WhatsApp trims very long names).
+        participants: List of phone numbers (digits only, with country code,
+            no + or symbols) OR full JIDs ending in "@s.whatsapp.net".
+            At least one participant other than yourself is required.
+
+    Returns:
+        The new group's info (same shape as get_group_info), or {"error": ...}.
+    """
+    return whatsapp_create_group(name, participants)
+
+
+@mcp.tool()
+def update_group_participants(
+    group_jid: str, action: str, participants: list[str]
+) -> dict[str, Any]:
+    """Add, remove, promote, or demote participants in a group you administer.
+
+    Args:
+        group_jid: The group's JID. Either "<id>@g.us" or just "<id>".
+        action: One of "add", "remove", "promote", "demote".
+        participants: List of phone numbers or JIDs to act on. Phone numbers
+            must be digits-only with country code (no + or symbols).
+
+    Returns:
+        {"action": "...", "results": [{"jid": "...", "status": <int>}, ...]}
+        where status is 0 on success and a non-zero WhatsApp code on failure
+        (e.g. 403 for "already a participant"). On transport failure the dict
+        contains an "error" key.
+    """
+    return whatsapp_update_group_participants(group_jid, action, participants)
+
+
+@mcp.tool()
+def get_group_invite_link(group_jid: str, reset: bool = False) -> dict[str, Any]:
+    """Return the shareable https://chat.whatsapp.com/<code> link for a group.
+
+    The account must be an admin of the group. Setting reset=True revokes
+    the previous link and generates a fresh one — anyone holding the old
+    link can no longer use it.
+
+    Args:
+        group_jid: The group's JID. Either "<id>@g.us" or just "<id>".
+        reset: Revoke the current link and issue a new one.
+
+    Returns:
+        {"invite_link": "https://chat.whatsapp.com/..."} or {"error": "..."}.
+    """
+    return whatsapp_get_group_invite_link(group_jid, reset)
 
 
 @mcp.tool()
@@ -594,6 +753,95 @@ def transcribe_audio(message_id: str, chat_jid: str, force: bool = False) -> dic
     }
 
 
+class _UploadTooLarge(Exception):
+    pass
+
+
+@mcp.custom_route("/upload", methods=["POST"])
+async def upload_route(request: Request) -> JSONResponse:
+    """Accept a raw file body and stash it on the shared store volume.
+
+    Body: the raw file bytes. Query: filename=<name with extension>.
+    Auth: the same bearer token as /mcp (enforced by BearerTokenAuth).
+    """
+    uploads.sweep()
+    filename = request.query_params.get("filename") or request.headers.get("x-filename")
+    if not filename:
+        return JSONResponse({"error": "filename query parameter is required"}, status_code=400)
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > uploads.MAX_UPLOAD_BYTES:
+        return JSONResponse({"error": f"file exceeds {uploads.MAX_UPLOAD_BYTES} bytes"}, status_code=413)
+
+    upload_id, path = uploads.new_upload(filename)
+    size = 0
+    try:
+        with open(path, "wb") as f:
+            async for chunk in request.stream():
+                size += len(chunk)
+                if size > uploads.MAX_UPLOAD_BYTES:
+                    raise _UploadTooLarge
+                f.write(chunk)
+    except _UploadTooLarge:
+        uploads.delete(upload_id)
+        return JSONResponse({"error": f"file exceeds {uploads.MAX_UPLOAD_BYTES} bytes"}, status_code=413)
+    except BaseException:
+        uploads.delete(upload_id)
+        raise
+    if size == 0:
+        uploads.delete(upload_id)
+        return JSONResponse({"error": "empty body; send the file bytes as the request body"}, status_code=400)
+
+    return JSONResponse(
+        {
+            "upload_id": upload_id,
+            "filename": os.path.basename(path),
+            "size": size,
+            "expires_in": uploads.UPLOAD_TTL_SECONDS,
+        },
+        status_code=201,
+    )
+
+
+class BearerTokenAuth:
+    """ASGI middleware that rejects HTTP requests without the expected bearer token.
+
+    /healthz is allowed through unauthenticated so container probes don't
+    need the secret.
+    """
+
+    def __init__(self, app, token: str):
+        self.app = app
+        self.expected = f"Bearer {token}".encode()
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http":
+            if scope["path"] == "/healthz":
+                await self._respond(send, 200, b"ok")
+                return
+            auth = dict(scope["headers"]).get(b"authorization", b"")
+            if not hmac.compare_digest(auth, self.expected):
+                await self._respond(send, 401, b"Unauthorized")
+                return
+        await self.app(scope, receive, send)
+
+    @staticmethod
+    async def _respond(send, status: int, body: bytes):
+        await send({"type": "http.response.start", "status": status,
+                    "headers": [(b"content-type", b"text/plain")]})
+        await send({"type": "http.response.body", "body": body})
+
+
+def _run_http_with_auth() -> None:
+    """Run the streamable-http MCP app behind bearer-token auth with uvicorn."""
+    import uvicorn
+
+    token = os.environ.get("MCP_AUTH_TOKEN", "")
+    if len(token) < 32:
+        raise SystemExit("MCP_AUTH_TOKEN must be set to a random string of at least 32 characters")
+    app = BearerTokenAuth(mcp.streamable_http_app(), token)
+    uvicorn.run(app, host=mcp.settings.host, port=mcp.settings.port)
+
+
 def shutdown_handler(signum, frame):
     """Handle shutdown signals gracefully to prevent zombie processes."""
     sys.exit(0)
@@ -624,4 +872,9 @@ if __name__ == "__main__":
 
     if transport == "stdio":
         install_stdio_parent_watchdog("WHATSAPP_PARENT_WATCHDOG_S", parent_pid=parent_pid)
-    mcp.run(transport=transport)
+    if transport == "streamable-http":
+        # Wrap FastMCP's streamable-http app in BearerTokenAuth and serve
+        # /upload + /healthz alongside /mcp from the same uvicorn process.
+        _run_http_with_auth()
+    else:
+        mcp.run(transport=transport)

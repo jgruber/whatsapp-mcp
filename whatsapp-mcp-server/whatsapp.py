@@ -1423,3 +1423,85 @@ def download_media(message_id: str, chat_jid: str) -> str | None:
     except Exception as e:
         print(f"Unexpected error: {str(e)}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Group management
+# ---------------------------------------------------------------------------
+
+
+def _bridge_json(method: str, path: str, body: dict | None = None, params: dict | None = None) -> tuple[int, Any]:
+    """Call the bridge and return (status_code, parsed_body_or_text).
+
+    Keeps the group helpers short — they only need the raw response.
+    """
+    url = f"{WHATSAPP_API_BASE_URL}{path}"
+    try:
+        resp = requests.request(
+            method, url, json=body, params=params, headers=_bridge_headers(), timeout=30
+        )
+    except requests.RequestException as e:
+        return 0, {"error": f"request error: {e}"}
+    try:
+        return resp.status_code, resp.json()
+    except json.JSONDecodeError:
+        return resp.status_code, {"error": resp.text or f"HTTP {resp.status_code}"}
+
+
+def list_groups() -> dict:
+    """GET /api/groups → {"groups": [...]} or {"error": ...}."""
+    status, body = _bridge_json("GET", "/groups")
+    if status == 200 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def get_group_info(group_jid: str) -> dict:
+    """GET /api/groups/{jid} → full group record with participants."""
+    status, body = _bridge_json("GET", f"/groups/{group_jid}")
+    if status == 200 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def create_group(name: str, participants: list[str]) -> dict:
+    """POST /api/groups — returns the new group's info on success."""
+    status, body = _bridge_json(
+        "POST", "/groups", body={"name": name, "participants": participants}
+    )
+    if status == 201 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def update_group_participants(
+    group_jid: str, action: str, participants: list[str]
+) -> dict:
+    """PATCH /api/groups/{jid}/participants — action in add|remove|promote|demote."""
+    status, body = _bridge_json(
+        "PATCH",
+        f"/groups/{group_jid}/participants",
+        body={"action": action, "participants": participants},
+    )
+    if status == 200 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def get_group_invite_link(group_jid: str, reset: bool = False) -> dict:
+    """GET or POST /api/groups/{jid}/invite-link → {"invite_link": "..."}."""
+    method = "POST" if reset else "GET"
+    status, body = _bridge_json(
+        method,
+        f"/groups/{group_jid}/invite-link",
+        params={"reset": "true"} if reset else None,
+    )
+    if status == 200 and isinstance(body, dict):
+        return body
+    return {"error": _error_message(body, status)}
+
+
+def _error_message(body: Any, status: int) -> str:
+    if isinstance(body, dict):
+        return body.get("error") or body.get("message") or f"HTTP {status}"
+    return str(body) if body else f"HTTP {status}"

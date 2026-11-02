@@ -155,14 +155,25 @@ func checkBearerToken(authHeader, expected string) bool {
 	return subtle.ConstantTimeCompare([]byte(got), []byte(expected)) == 1
 }
 
-// buildAllowedHosts returns the static allow-list for a given bind port.
+// buildAllowedHosts returns the Host allow-list for a given bind port.
 // We accept the three loopback spellings (IPv4, name, IPv6) because the
 // MCP server's choice of WHATSAPP_API_URL determines which Host header the
 // underlying HTTP client emits.
+//
+// WHATSAPP_BRIDGE_ALLOWED_HOSTS (comma-separated host[:port] values) adds
+// extra accepted spellings. Required when the bridge is reached by a
+// different name — e.g. the Docker service name "bridge:8080" when the MCP
+// server runs in a sibling container.
 func buildAllowedHosts(port int) map[string]struct{} {
-	return map[string]struct{}{
+	allowed := map[string]struct{}{
 		fmt.Sprintf("127.0.0.1:%d", port): {},
 		fmt.Sprintf("localhost:%d", port): {},
 		fmt.Sprintf("[::1]:%d", port):     {},
 	}
+	for _, h := range strings.Split(os.Getenv("WHATSAPP_BRIDGE_ALLOWED_HOSTS"), ",") {
+		if h = strings.ToLower(strings.TrimSpace(h)); h != "" {
+			allowed[h] = struct{}{}
+		}
+	}
+	return allowed
 }

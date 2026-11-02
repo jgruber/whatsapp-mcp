@@ -2514,6 +2514,9 @@ func newRESTMux(client *whatsmeow.Client, messageStore *MessageStore, port int, 
 	// On-demand history sync endpoint (see history_ondemand.go)
 	registerHistoryEndpoint(mux, auth, client, messageStore)
 
+	// Group management endpoints (see groups.go)
+	registerGroupRoutes(mux, auth, client)
+
 	// Health check endpoint
 	mux.HandleFunc("/api/health", auth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -2931,9 +2934,15 @@ func newManagedRESTMux(client *whatsmeow.Client, messageStore *MessageStore, por
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int, token string, allowedMediaRoots []string, connection *connectionManager) {
 	handler := newManagedRESTMux(client, messageStore, port, token, allowedMediaRoots, connection)
 
-	// Start the server with proper timeouts. Bind to loopback so the bridge is
-	// not reachable from the LAN; MCP clients talk to it over localhost.
-	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	// Start the server with proper timeouts. Default bind is loopback so the
+	// bridge is not reachable from the LAN; MCP clients talk to it over
+	// localhost. WHATSAPP_BRIDGE_BIND overrides this — e.g. "0.0.0.0" in a
+	// container, where the Docker network itself is the trust boundary.
+	bindHost := strings.TrimSpace(os.Getenv("WHATSAPP_BRIDGE_BIND"))
+	if bindHost == "" {
+		bindHost = "127.0.0.1"
+	}
+	serverAddr := fmt.Sprintf("%s:%d", bindHost, port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Create server with timeouts for stability

@@ -96,6 +96,125 @@ Keep the patched dependency rather than restoring the old vulnerable version pin
 
 4. **Restart Claude Desktop**
 
+### Docker Compose (self-hosted HTTP)
+
+Prefer not to install Go, Python, and `uv` locally? Public images are
+published to Docker Hub and the whole stack runs with Docker Compose.
+**Each stack pairs one WhatsApp account** — run a separate stack per account.
+The MCP server is exposed over the streamable-HTTP transport and guarded by a
+bearer token you set.
+
+Prerequisites: Docker Engine 24+ with the Compose plugin.
+
+1. **Save this as `docker-compose.yml`.** It is the same compose file the
+   project runs in production (`docker-compose.portainer.yml`); clone the
+   repo and point `docker compose` at that file if you prefer.
+
+   ```yaml
+   services:
+     bridge:
+       image: docker.io/jgruber/whatsapp-mcp-bridge:latest
+       restart: unless-stopped
+       environment:
+         WHATSAPP_BRIDGE_PORT: "8080"
+         WHATSAPP_BRIDGE_ALLOWED_HOSTS: bridge:8080
+         WHATSAPP_DB_PATH: /app/store/messages.db
+         WHATSMEOW_DB_PATH: /app/store/whatsapp.db
+         WHATSAPP_DEVICE_NAME: ${WHATSAPP_DEVICE_NAME:-whatsapp-mcp}
+         WHATSAPP_MEDIA_ROOTS: /app/store/outbox:/app/store/uploads
+       volumes:
+         - store:/app/store
+
+     mcp:
+       image: docker.io/jgruber/whatsapp-mcp-server:latest
+       restart: unless-stopped
+       depends_on:
+         - bridge
+       environment:
+         WHATSAPP_MCP_TRANSPORT: http
+         WHATSAPP_MCP_HOST: 0.0.0.0
+         WHATSAPP_MCP_PORT: "8000"
+         WHATSAPP_API_URL: http://bridge:8080/api
+         WHATSAPP_DB_PATH: /app/store/messages.db
+         WHATSMEOW_DB_PATH: /app/store/whatsapp.db
+         MCP_AUTH_TOKEN: ${MCP_AUTH_TOKEN:?set MCP_AUTH_TOKEN to a random string of at least 32 chars}
+         UPLOAD_DIR: /app/store/uploads
+         WHATSAPP_MCP_ALLOWED_HOSTS: ${WHATSAPP_MCP_ALLOWED_HOSTS:-}
+       ports:
+         - "${MCP_HOST_PORT:-8800}:8000"
+       volumes:
+         - store:/app/store
+
+   volumes:
+     store:
+   ```
+
+2. **Create a `.env` alongside it:**
+
+   ```env
+   # Required: bearer token every MCP client must present
+   # Generate with: openssl rand -hex 32
+   MCP_AUTH_TOKEN=change-me-to-at-least-32-random-chars
+
+   # Optional: label shown in WhatsApp > Linked Devices
+   # (change if you plan to run more than one stack on this host)
+   WHATSAPP_DEVICE_NAME=whatsapp-mcp
+
+   # Optional: host port the MCP server listens on (default 8800)
+   MCP_HOST_PORT=8800
+
+   # Optional: public hostname if you reverse-proxy the MCP endpoint —
+   # FastMCP's Host-header allow-list already accepts loopback; add
+   # extras here, comma-separated.
+   # WHATSAPP_MCP_ALLOWED_HOSTS=mcp.example.com
+   ```
+
+3. **Launch and pair:**
+
+   ```bash
+   docker compose up -d
+   docker compose logs -f bridge
+   ```
+
+   The bridge prints a QR code on first start. On your phone: **WhatsApp >
+   Settings > Linked Devices > Link a Device**, and scan it. The paired
+   session is written to the `store` named volume and persists across
+   restarts, redeploys, and image updates — no re-scan on upgrades.
+
+4. **Smoke-test:**
+
+   ```bash
+   source .env   # or export MCP_AUTH_TOKEN manually
+   curl -fsS http://127.0.0.1:${MCP_HOST_PORT:-8800}/healthz
+   curl -fsS -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+     -H 'Content-Type: application/json' \
+     -H 'Accept: application/json, text/event-stream' \
+     -X POST http://127.0.0.1:${MCP_HOST_PORT:-8800}/mcp \
+     -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' | head
+   ```
+
+5. **Connect an MCP client.** Any client that supports the streamable-HTTP MCP
+   transport can connect at `http://<host>:8800/mcp` with your bearer token
+   in `Authorization: Bearer …`. Claude Desktop and Cursor currently launch
+   MCP servers over stdio only — for those, keep the Quick Start above, or
+   put a stdio-to-HTTP proxy in front of this endpoint.
+
+**Updating:** `docker compose pull && docker compose up -d`. The named volume
+is preserved, so the paired-device session survives.
+
+**Running multiple accounts.** Each stack pairs one device. To host more than
+one, give each user their own compose project directory (own `.env`, own named
+volume, own `MCP_HOST_PORT`, own `WHATSAPP_DEVICE_NAME`) and launch each stack
+independently. If you expose them publicly, give each stack its own hostname
+and reverse-proxy entry — the bearer token is the only barrier between the
+public internet and that WhatsApp account.
+
+**Security.** Use a long random `MCP_AUTH_TOKEN` (`openssl rand -hex 32`),
+rotate on suspicion, and only expose the port through a reverse proxy that
+terminates TLS. When you reverse-proxy from a public hostname, set
+`WHATSAPP_MCP_ALLOWED_HOSTS` to that hostname so FastMCP's DNS-rebinding guard
+accepts the forwarded `Host:` header.
+
 ### Updating
 
 Pull the latest changes, then refresh whichever components moved:
